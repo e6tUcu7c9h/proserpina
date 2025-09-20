@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- SQLite insertion and export operations
 
 ## [0.1.1] - 2024-11-14
 ### Added

@@ -1,3 +1,3 @@
 # Proserpina
 
-Jira to local DB reporting automation
+Third party services data exports into local database automation helpers.
