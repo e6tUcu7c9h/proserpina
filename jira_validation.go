@@ -116,3 +116,50 @@ func validateJiraIssue(issue *jiraIssue) error {
 
 	return nil
 }
+
+const (
+	maxJQLLength  = 4000 // conservative cap to prevent abuse
+	maxJQLClauses = 200  // rough guardrail against overly complex queries
+)
+
+// validateAndSanitizeJQL validates a user-provided JQL override and returns a safe form.
+// It forbids control characters, query parameter injection, and overly long or complex inputs.
+func validateAndSanitizeJQL(jql string) (string, error) {
+	if jql == "" {
+		return "", fmt.Errorf("JQL cannot be empty")
+	}
+	if len(jql) > maxJQLLength {
+		return "", fmt.Errorf("JQL too long (max %d characters)", maxJQLLength)
+	}
+	// Reject control characters and line breaks
+	if strings.ContainsAny(jql, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0B\x0C\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\r\n") {
+		return "", fmt.Errorf("JQL contains illegal control characters")
+	}
+	// Prevent query parameter injection attempts like "&maxResults=..."
+	if strings.Contains(jql, "&") || strings.Contains(jql, "#") {
+		return "", fmt.Errorf("JQL must not contain '&' or '#'")
+	}
+	// Disallow raw URL-encoded query delimiters to avoid hidden injections
+	if strings.Contains(strings.ToLower(jql), "%26") || strings.Contains(strings.ToLower(jql), "%23") {
+		return "", fmt.Errorf("JQL must not contain encoded '&' or '#'")
+	}
+	// Basic sanity: avoid obvious URL forms (user mistakenly pasting full URL)
+	if _, err := url.ParseRequestURI(jql); err == nil && strings.Contains(jql, "://") {
+		return "", fmt.Errorf("JQL must be an expression, not a URL")
+	}
+	// Optional conservative token whitelist (letters, digits, space, quotes, punctuation commonly used in JQL)
+	// This still allows field names, operators, strings, and functions.
+	var jqlRe = regexp.MustCompile(`^[A-Za-z0-9_\-.:,"'() \t=<>!|&+*/?\\[\]]+$`)
+	if !jqlRe.MatchString(jql) {
+		return "", fmt.Errorf("JQL contains unsupported characters")
+	}
+	// Rough complexity guard: limit number of boolean operators/clauses
+	upper := strings.ToUpper(jql)
+	tokens := regexp.MustCompile(`\b(AND|OR|NOT|ORDER BY|IN|IS|WAS|CHANGED|BEFORE|AFTER|ON|BY|DURING)\b`).FindAllStringIndex(upper, -1)
+	if len(tokens) > maxJQLClauses {
+		return "", fmt.Errorf("JQL too complex (over %d logical tokens)", maxJQLClauses)
+	}
+	// Trim and collapse excessive whitespace
+	safe := strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(jql, " "))
+	return safe, nil
+}

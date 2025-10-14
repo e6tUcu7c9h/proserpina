@@ -65,6 +65,19 @@ func execSQLScript(ctx context.Context, exec sqlExecer, sqlBytes []byte, source 
 func RunQuery(dbFilepath string, queryFilepath string) error {
 	log.Printf("runQuery: executing SQL script %q on database %q", queryFilepath, dbFilepath)
 
+	// Validate and ensure database path
+	if dbFilepath == "" {
+		return fmt.Errorf("database file path cannot be empty")
+	}
+	if len(dbFilepath) > 4096 {
+		return fmt.Errorf("database file path too long (max 4096 characters)")
+	}
+	if dir := filepath.Dir(dbFilepath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("ensure database directory: %w", err)
+		}
+	}
+
 	sqlBytes, err := os.ReadFile(queryFilepath)
 	if err != nil {
 		return fmt.Errorf("read query file %q: %w", queryFilepath, err)
@@ -145,6 +158,19 @@ func classifyScript(name string, content []byte) (weight int, numPrefix int) {
 // RunQueryFolder loads all .sql files in the folder, orders them robustly, and executes them atomically.
 func RunQueryFolder(dbFilepath string, queryFolderFilepath string) error {
 	log.Printf("RunQueryFolder: executing SQL scripts in %q on database %q", queryFolderFilepath, dbFilepath)
+
+	// Validate and ensure database path
+	if dbFilepath == "" {
+		return fmt.Errorf("database file path cannot be empty")
+	}
+	if len(dbFilepath) > 4096 {
+		return fmt.Errorf("database file path too long (max 4096 characters)")
+	}
+	if dir := filepath.Dir(dbFilepath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("ensure database directory: %w", err)
+		}
+	}
 
 	entries, err := os.ReadDir(queryFolderFilepath)
 	if err != nil {
@@ -247,11 +273,23 @@ func ExportTable(dbFile string, tableName string, csvFile string) error {
 	if dbFile == "" {
 		return fmt.Errorf("database file path cannot be empty")
 	}
+	if len(dbFile) > 4096 {
+		return fmt.Errorf("database file path too long (max 4096 characters)")
+	}
 	if tableName == "" {
 		return fmt.Errorf("table name cannot be empty")
 	}
 	if csvFile == "" {
 		return fmt.Errorf("CSV file path cannot be empty")
+	}
+	if len(csvFile) > 4096 {
+		return fmt.Errorf("CSV file path too long (max 4096 characters)")
+	}
+	// Ensure CSV directory exists (common pitfall)
+	if dir := filepath.Dir(csvFile); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("ensure CSV directory: %w", err)
+		}
 	}
 
 	// Validate and quote the table name to avoid SQL injection via identifiers.

@@ -18,8 +18,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// TODO: Configuration schema validation
-
 const (
 	pageSize = 1000
 )
@@ -35,47 +33,95 @@ type jiraIssue struct {
 	Fields map[string]interface{} `json:"fields"`
 }
 
-func fetchIssues(jiraBaseURL, projectKey string, headers map[string]string, startAt int) (jiraResponse, error) {
+
+// fetchIssues performs a single paginated fetch.
+func fetchIssues(jiraBaseURL, projectKey string, headers map[string]string, startAt int, jqlOverride string) (jiraResponse, error) {
 	log.Printf("Fetching issues from %d", startAt)
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", jiraBaseURL, nil)
-	if err != nil {
-		return jiraResponse{}, err
+
+	// Prepare request parameters once; request will be rebuilt per attempt to attach a fresh context.
+	buildRequest := func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, jiraBaseURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "proserpina/1.0")
+		}
+		// Query parameters
+		q := req.URL.Query()
+		if jqlOverride != "" {
+			safeJQL, vErr := validateAndSanitizeJQL(jqlOverride)
+			if vErr != nil {
+				return nil, fmt.Errorf("invalid JQL override: %w", vErr)
+			}
+			q.Set("jql", safeJQL)
+		} else {
+			q.Set("jql", fmt.Sprintf("project=%s", projectKey))
+		}
+		q.Set("startAt", strconv.Itoa(startAt))
+		q.Set("maxResults", strconv.Itoa(pageSize))
+		q.Set("fields", "*all")
+		// Always enable changelog
+		q.Set("expand", "changelog")
+		req.URL.RawQuery = q.Encode()
+		return req, nil
 	}
 
-	// Set headers for authentication
-	for name, value := range headers {
-		req.Header.Set(name, value)
+	client := &http.Client{} // no timeout to accommodate slow Jira API
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := buildRequest(ctx)
+		if err != nil {
+			cancel()
+			return jiraResponse{}, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			if attempt < 3 {
+				time.Sleep(time.Duration(50*attempt) * time.Millisecond)
+				continue
+			}
+			return jiraResponse{}, err
+		}
+
+		// Read and handle response
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			cancel()
+			// Retry on 429/5xx
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				if attempt < 3 {
+					time.Sleep(time.Duration(50*attempt) * time.Millisecond)
+					continue
+				}
+				return jiraResponse{}, fmt.Errorf("JIRA API %s returned status %d: %s", req.URL.String(), resp.StatusCode, string(bodySnippet))
+			}
+			// Non-retryable status
+			return jiraResponse{}, fmt.Errorf("JIRA API %s returned status %d: %s", req.URL.String(), resp.StatusCode, string(bodySnippet))
+		}
+
+		var jr jiraResponse
+		decErr := json.NewDecoder(resp.Body).Decode(&jr)
+		resp.Body.Close()
+		cancel()
+		if decErr != nil {
+			if attempt < 3 {
+				time.Sleep(time.Duration(50*attempt) * time.Millisecond)
+				continue
+			}
+			return jiraResponse{}, decErr
+		}
+		return jr, nil
 	}
 
-	// Set query parameters
-	q := req.URL.Query()
-	q.Add("jql", fmt.Sprintf("project=%s", projectKey))
-	q.Add("startAt", strconv.Itoa(startAt))
-	q.Add("maxResults", strconv.Itoa(pageSize))
-	q.Add("fields", "*all")
-	req.URL.RawQuery = q.Encode()
-
-	// Send request
-	resp, err := client.Do(req)
-	if err != nil {
-		return jiraResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	// Fail on non-2xx to avoid incomplete datasets
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return jiraResponse{}, fmt.Errorf("JIRA API %s returned status %d: %s", req.URL.String(), resp.StatusCode, string(bodySnippet))
-	}
-
-	// Decode the response
-	var jr jiraResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
-		return jiraResponse{}, err
-	}
-
-	return jr, nil
+	return jiraResponse{}, fmt.Errorf("unexpected fetch state")
 }
 
 func saveIssuesToDB(issues []jiraIssue, dbFile string, tableName string) error {
@@ -231,10 +277,10 @@ func saveIssuesToDB(issues []jiraIssue, dbFile string, tableName string) error {
 	return nil
 }
 
-func worker(wg *sync.WaitGroup, jiraBaseURL, projectKey string, headers map[string]string, jobs <-chan int, results chan<- jiraResponse, errCount *int64) {
+func worker(wg *sync.WaitGroup, jiraBaseURL, projectKey string, headers map[string]string, jobs <-chan int, results chan<- jiraResponse, errCount *int64, jqlOverride string) {
 	defer wg.Done()
 	for startAt := range jobs {
-		jr, err := fetchIssues(jiraBaseURL, projectKey, headers, startAt)
+		jr, err := fetchIssues(jiraBaseURL, projectKey, headers, startAt, jqlOverride)
 		if err != nil {
 			atomic.AddInt64(errCount, 1)
 			log.Printf("Error fetching issues at startAt %d: %v", startAt, err)
@@ -245,71 +291,80 @@ func worker(wg *sync.WaitGroup, jiraBaseURL, projectKey string, headers map[stri
 	}
 }
 
-func ExportIssues(jiraBaseURL string, headers map[string]string, dbFile string, projectKey string, tableName string) {
+// ExportIssues exports Jira issues into a SQLite database table.
+// Parameters:
+// - jiraBaseURL: full search API URL endpoint (e.g., https://your-jira/rest/api/2/search)
+// - headers: HTTP headers for authentication
+// - dbFile: path to SQLite file
+// - projectKey: Jira project key (used if jqlOverride is empty)
+// - tableName: destination table
+// - concurrent: number of concurrent workers (if <= 0, a safe default is used)
+// - jqlOverride: custom JQL; when empty, defaults to "project=<projectKey>"
+func ExportIssues(jiraBaseURL string, headers map[string]string, dbFile string, projectKey string, tableName string, concurrent int, jqlOverride string) error {
 	// Input validation
 	if jiraBaseURL == "" {
-		log.Printf("Error: JIRA base URL cannot be empty")
-		return
+		return fmt.Errorf("JIRA base URL cannot be empty")
 	}
 	if err := validateJiraBaseURL(jiraBaseURL); err != nil {
-		log.Printf("Error: %v", err)
-		return
+		return err
 	}
 	if err := validateHeaders(headers); err != nil {
-		log.Printf("Error: %v", err)
-		return
+		return err
 	}
-	if err := validateProjectKey(projectKey); err != nil {
-		log.Printf("Error: %v", err)
-		return
+	if jqlOverride == "" {
+		if err := validateProjectKey(projectKey); err != nil {
+			return err
+		}
+	} else {
+		if _, err := validateAndSanitizeJQL(jqlOverride); err != nil {
+			return fmt.Errorf("invalid JQL override: %w", err)
+		}
 	}
 	if dbFile == "" {
-		log.Printf("Error: database file path cannot be empty")
-		return
+		return fmt.Errorf("database file path cannot be empty")
 	}
 	if tableName == "" {
-		log.Printf("Error: table name cannot be empty")
-		return
+		return fmt.Errorf("table name cannot be empty")
 	}
 	if _, err := sanitizeIdentifierRaw(tableName); err != nil {
-		log.Printf("Error: invalid table name: %v", err)
-		return
+		return fmt.Errorf("invalid table name: %w", err)
 	}
 
-	log.Printf("Exporting issues for project key: %s", projectKey)
+	if concurrent <= 0 {
+		concurrent = 8
+	}
+
+	log.Printf("Exporting issues. project: %s, concurrent: %d, changelog: %t, jqlOverride: %t", projectKey, concurrent, true, jqlOverride != "")
 
 	var wg sync.WaitGroup
 	var errCount int64
 
-	numWorkers := 24
-	jobs := make(chan int, numWorkers)             // Channel for startAt pagination values
-	results := make(chan jiraResponse, numWorkers) // Channel for the results from API calls
+	numWorkers := concurrent
+	jobs := make(chan int, numWorkers)
+	results := make(chan jiraResponse, numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(&wg, jiraBaseURL, projectKey, headers, jobs, results, &errCount)
+		go worker(&wg, jiraBaseURL, projectKey, headers, jobs, results, &errCount, jqlOverride)
 	}
 
 	// Fetch first page to know total issues
-	firstResponse, err := fetchIssues(jiraBaseURL, projectKey, headers, 0)
+	firstResponse, err := fetchIssues(jiraBaseURL, projectKey, headers, 0, jqlOverride)
 	if err != nil {
-		log.Printf("Failed to fetch first page: %v", err)
-		return
+		return fmt.Errorf("failed to fetch first page: %w", err)
 	}
 
 	totalIssues := firstResponse.Total
 	log.Printf("Total number of issues: %d", totalIssues)
 
-	// Pre-allocate slice for all issues
 	allIssues := make([]jiraIssue, 0, totalIssues)
 	allIssues = append(allIssues, firstResponse.Issues...)
 
 	for startAt := pageSize; startAt < totalIssues; startAt += pageSize {
 		jobs <- startAt
 	}
-	close(jobs) // Close jobs channel after sending all jobs
+	close(jobs)
 
-	// Collect results
 	collectorDone := make(chan struct{})
 	go func() {
 		defer close(collectorDone)
@@ -319,37 +374,23 @@ func ExportIssues(jiraBaseURL string, headers map[string]string, dbFile string, 
 	}()
 
 	wg.Wait()
-	close(results) // Close results channel when all workers are done
+	close(results)
 	<-collectorDone
 
-	// Final validation before saving
 	finalCount := len(allIssues)
-
-	if finalCount == 0 {
-		log.Printf("Warning: No issues found for project %s", projectKey)
-		return
-	}
-
-	// Abort if any request failed to avoid an incomplete dataset
 	if failed := atomic.LoadInt64(&errCount); failed > 0 {
-		log.Printf("Aborting export: %d request(s) failed; refusing to produce incomplete dataset", failed)
-		return
+		return fmt.Errorf("aborting export: %d request(s) failed; refusing to produce incomplete dataset", failed)
 	}
 
-	log.Printf("Collected %d issues, writing database directly to %s", finalCount, dbFile)
-
-	// Ensure the destination directory exists.
 	dir := filepath.Dir(dbFile)
 	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
-		log.Printf("Failed to ensure database directory: %v", mkErr)
-		return
+		return fmt.Errorf("failed to ensure database directory: %w", mkErr)
 	}
 
-	err = saveIssuesToDB(allIssues, dbFile, tableName)
-	if err != nil {
-		log.Printf("Failed to save issues to database: %v", err)
-		return
+	if err = saveIssuesToDB(allIssues, dbFile, tableName); err != nil {
+		return fmt.Errorf("failed to save issues to database: %w", err)
 	}
 
-	log.Println("Jira issues export completed successfully.")
+	log.Printf("Exported %d issues to %s.", finalCount, dbFile)
+	return nil
 }
